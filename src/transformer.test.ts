@@ -1,6 +1,6 @@
 import {Transformer} from 'ts-transformer-testing-library';
 import * as ts from 'typescript';
-import makeTransformerFactory from "./";
+import makeTransformerFactory from "./transformer";
 import * as fs from 'fs';
 
 const transformer = new Transformer()
@@ -28,7 +28,7 @@ it("should transform normal assert call into inspecto patronum assert call", () 
         // @ts-ignore
         const inspect = require('browser-util-inspect');
         
-        let testUpvalue = 24;
+        let testUpvalue = 0;
         
         function shouldNotBeCalled(): string {
             throw new Error('shouldNotBeCalled');
@@ -64,7 +64,7 @@ it("should transform normal assert call into inspecto patronum assert call", () 
         
         class AssertionFailedError extends Error {
             constructor(val: unknown, msg: string | undefined, pd?: ParamDetails | undefined) {
-                let msgParts = ['Assertion failed: '];
+                let msgParts = [];//['Assertion failed: '];
                 if(msg !== undefined)
                     msgParts.push(msg);
                 
@@ -103,7 +103,7 @@ it("should transform normal assert call into inspecto patronum assert call", () 
         function onlyDefined<T>(v: T, /** @lazy */ msg?: string): NonNullable<T> {
             testUpvalue++;
             if(v === undefined || v === null)
-                throw new Error(\`Assertion failed: \${msg ?? v}\`);
+                throw new AssertionFailedError(v, msg, getCallSiteDetails()?.params[0]);
             return v as NonNullable<T>;
         }
         
@@ -115,18 +115,27 @@ it("should transform normal assert call into inspecto patronum assert call", () 
             assert(true, shouldNotBeCalled());
             onlyDefined(false);
             assert(testUpvalue == 0);
+            
+            let x = 0;
+            assert(true, String(x++));
+            assert(x == 0);
         }
-        console.log('uhhhh', testUpvalue);
+        assert(testUpvalue == 5);
         
-        assert(testUpvalue == 27);
+        /*********************/
+        /*********************/
         
         try {
-            const x = 2;
-            const y = 3;
-            assert(x + 1 == 2 * y - 10, \`oh no! \${x}\`);
+            const two = 2;
+            const three = 3;
+            let fourFiveSix = 4;
+            assert(two + 1 + fourFiveSix++ == fourFiveSix + 2 * three - parseFloat('1.5' + 'e2') + ++fourFiveSix, \`oh \${'no'}!\`);
         } catch(e) {
             console.log(e);
         }
+        
+        /*********************/
+        /*********************/
         
         const x = 2, y = 2, z = 3;
         const tests = [
@@ -180,37 +189,16 @@ it("should transform normal assert call into inspecto patronum assert call", () 
             // function ImportKeyword() { try{ assert(import('fail')) } catch(e) {}; }
         ]
         for (const test of tests) {
-            console.log(test.name, test());
+            test();
         }
+        
+        
+        /*********************/
+        /*********************/
+        // assert(fs.appendFileSync);
     `);
     // console.log(out);
     fs.writeFileSync('output.js', out);
     eval(out);
     expect(out);
 });
-
-
-interface CallSiteDetails_Argument_Part {
-    part: string;
-
-}
-
-interface CallSiteDetails_Argument {
-    name: string;
-    parts: CallSiteDetails_Argument_Part[];
-}
-
-interface CallSiteDetails {
-    expression: string;
-    arguments: CallSiteDetails_Argument[];
-}
-
-const getCallSiteDetails = () => {
-
-};
-
-const assert = (v: any, msg?: string): asserts v => {
-    if (v) return;
-
-
-};

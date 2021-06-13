@@ -1,26 +1,17 @@
-//
-
 /** @inline-special-getCallSiteDetails */
-export function getCallSiteDetails(): CallSiteDetails | undefined {
-    return undefined;
+export declare function getCallSiteDetails(): CallSiteDetails | undefined;
+export declare namespace getCallSiteDetails {
+    var UNEVALUATED: symbol;
 }
-
-getCallSiteDetails.UNEVALUATED = Symbol('getCallSiteDetails.UNEVALUATED');
-
-
 export interface ParamPart {
     expression: string;
     value: any | typeof getCallSiteDetails.UNEVALUATED;
-    subs: ParamPart[];
+    children: ParamPart[];
 }
-
 export interface ParamDetails {
     name: string;
-    parts: ParamPart[];
+    rootPart: ParamPart;
 }
-
 export interface CallSiteDetails {
     params: ParamDetails[];
 }
-
-
