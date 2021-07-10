@@ -4,12 +4,25 @@ exports.getOrPut = void 0;
 const ts = require("typescript");
 const typescript_1 = require("typescript");
 const ts_clone_node_1 = require("ts-clone-node");
+ts.SyntaxKind.NoSubstitutionTemplateLiteral;
+function setOriginalNode(node, original) {
+    if (node == original)
+        return node;
+    return ts.setOriginalNode(node, original);
+}
+function setImmediateParent(nodes, parent) {
+    for (const node of 'length' in nodes ? nodes : [nodes]) {
+        node.parent = parent;
+    }
+    return nodes;
+}
 const defaultOpts = {
     jsDocTagNames: {
         inline: 'inline',
         inlineAsBlock: 'inline-as-block',
         inlineAsImmediatelyInvokedArrowFunction: 'inline-as-func',
         lazy: 'lazy',
+        inspectable: 'inspectable',
         specialGetCallSiteDetails: 'inline-special-getCallSiteDetails',
     }
 };
@@ -36,9 +49,10 @@ const makeTransformerFactory = (program, optsIn) => (ctx) => (sourceFile) => {
                 const sym = checker.getSymbolAtLocation(paramDecl.name);
                 if (!sym)
                     throw new Error('wtf');
-                const lazyTags = ts.getJSDocTags(paramDecl).filter(tag => tag.tagName.text == opts.jsDocTagNames.lazy);
-                const isLazy = lazyTags.length > 0;
-                const info = { sym, decl: paramDecl, isLazy };
+                const tags = ts.getJSDocTags(paramDecl);
+                const isLazy = tags.some(tag => tag.tagName.text == opts.jsDocTagNames.lazy);
+                const isInspectable = tags.some(tag => tag.tagName.text == opts.jsDocTagNames.inspectable);
+                const info = { sym, decl: paramDecl, isLazy, isInspectable };
                 parameterInfosBySymbol.set(sym, info);
                 return info;
             });
@@ -49,7 +63,7 @@ const makeTransformerFactory = (program, optsIn) => (ctx) => (sourceFile) => {
                 if (ts.isPropertyAccessExpression(node.parent) && node == node.parent.name)
                     return;
                 const symbol = checker.getSymbolAtLocation(node);
-                if (!symbol || (symbol.getFlags() & ts.SymbolFlags.Type))
+                if (!symbol || !(symbol.getFlags() & ts.SymbolFlags.Value))
                     return;
                 let hasDeclarationsWithout = false;
                 for (const symDecl of (_a = symbol.getDeclarations()) !== null && _a !== void 0 ? _a : []) {
@@ -122,6 +136,31 @@ const makeTransformerFactory = (program, optsIn) => (ctx) => (sourceFile) => {
             ])),
         ];
     };
+    const checkFunctionDeclarationJSDocTagsFromCallExpression = (callExpr, check) => {
+        const signature = checker.getResolvedSignature(callExpr);
+        if (signature === undefined)
+            return null;
+        const decl = signature.declaration;
+        if (decl === undefined)
+            return null;
+        const inlineTags = ts.getJSDocTags(decl).filter(check);
+        if (inlineTags.length == 0)
+            return null;
+        switch (decl.kind) {
+            case ts.SyntaxKind.FunctionDeclaration:
+                // ok
+                break;
+            case ts.SyntaxKind.FunctionExpression:
+            case ts.SyntaxKind.MethodDeclaration:
+            case ts.SyntaxKind.Constructor:
+            case ts.SyntaxKind.GetAccessor:
+            case ts.SyntaxKind.SetAccessor:
+            case ts.SyntaxKind.ArrowFunction:
+            default:
+                throw new Error(`ts-inline: Cannot yet handle inlining of functions defined using a ts.SyntaxKind.${ts.SyntaxKind[decl.kind]} visitNode`);
+        }
+        return { inlineTags, decl };
+    };
     const maybeInlineCallExpression = (visitNode) => {
         var _a, _b, _c;
         let callNode, containingNode;
@@ -139,28 +178,10 @@ const makeTransformerFactory = (program, optsIn) => (ctx) => (sourceFile) => {
         else {
             return null;
         }
-        const signature = checker.getResolvedSignature(callNode);
-        if (signature === undefined)
+        const check = checkFunctionDeclarationJSDocTagsFromCallExpression(callNode, tag => inlineTagSet.has(tag.tagName.text));
+        if (check == null)
             return null;
-        const decl = signature.declaration;
-        if (decl === undefined)
-            return null;
-        const inlineTags = ts.getJSDocTags(decl).filter(tag => inlineTagSet.has(tag.tagName.text));
-        if (inlineTags.length == 0)
-            return null;
-        switch (decl.kind) {
-            case ts.SyntaxKind.FunctionDeclaration:
-                // ok
-                break;
-            case ts.SyntaxKind.FunctionExpression:
-            case ts.SyntaxKind.MethodDeclaration:
-            case ts.SyntaxKind.Constructor:
-            case ts.SyntaxKind.GetAccessor:
-            case ts.SyntaxKind.SetAccessor:
-            case ts.SyntaxKind.ArrowFunction:
-            default:
-                throw new Error(`ts-inline: Cannot yet handle inlining of functions defined using a ts.SyntaxKind.${ts.SyntaxKind[decl.kind]} visitNode`);
-        }
+        const { inlineTags, decl } = check;
         let declInfo = getOrPut(inlineableFunctionInfos, decl, () => new InlineableFunctionInfo(decl));
         const mustBeBlock = inlineTags.some(tag => tag.tagName.text == opts.jsDocTagNames.inlineAsBlock);
         const mustBeArrowFunc = inlineTags.some(tag => tag.tagName.text == opts.jsDocTagNames.inlineAsImmediatelyInvokedArrowFunction);
@@ -185,26 +206,82 @@ const makeTransformerFactory = (program, optsIn) => (ctx) => (sourceFile) => {
             let callValue = callNode.arguments[paramIdx];
             if (callValue === undefined)
                 callValue = f.createVoidZero();
-            if (needsCallSiteDetails) {
+            if (needsCallSiteDetails && paramInfo.isInspectable) {
                 let rootPart = undefined;
                 const stack = [];
-                const deepInspectVisitor = node => {
+                const deepInspectVisitor = parent => node => {
                     let result;
                     // if (ts.isFunctionExpression(node) || ts.isArrowFunction(node)) {
                     //     result = node;
-                    // } else if (ts.isToken(node) || ts.isLiteralExpression(node)) {
-                    //     result = node;
-                    // } else if (ts.isParenthesizedExpression(node)) {
-                    //     result = node;
-                    // } else
-                    if (stack.length > 0 && ts.isToken(node) && !ts.isIdentifier(node)) {
+                    if (node.kind >= ts.SyntaxKind.FirstTypeNode && node.kind <= ts.SyntaxKind.LastTypeNode
+                        || ts.isParameter(node)
+                        || ts.isClassExpression(node)) {
+                        result = node;
+                        // } else if (ts.isPropertyAssignment(node)) {
+                        //     // Property name is an identifier but we can't treat it like an expression
+                        //     result = f.updatePropertyAssignment(node,
+                        //         node.name, ts.visitNode(node.initializer, deepInspectVisitor)
+                        //     );
+                    }
+                    else if (ts.isShorthandPropertyAssignment(node)) {
+                        // Convert shorthand ( {x} ) to regular ( {x: x} ) so we can inspect the value
+                        result = f.createPropertyAssignment(node.name, ts.visitNode(node.name, deepInspectVisitor(node)));
+                        // } else if (ts.isMethodDeclaration(node)) {
+                        //     // Method name is an identifier but we can't treat it like an expression
+                        //     result = f.updateMethodDeclaration(node,
+                        //         node.decorators, node.modifiers, node.asteriskToken, node.name, node.questionToken, node.typeParameters, node.parameters, node.type,
+                        //         ts.visitNode(node.body, deepInspectVisitor)
+                        //     );
+                        // } else if (ts.isSetAccessorDeclaration(node)) {
+                        //     // Accessor property name is an identifier but we can't treat it like an expression
+                        //     result = f.updateSetAccessorDeclaration(node,
+                        //         node.decorators, node.modifiers, node.name, node.parameters,
+                        //         ts.visitNode(node.body, deepInspectVisitor)
+                        //     );
+                        // } else if (ts.isGetAccessorDeclaration(node)) {
+                        //     // Accessor property name is an identifier but we can't treat it like an expression
+                        //     result = f.updateGetAccessorDeclaration(node,
+                        //         node.decorators, node.modifiers, node.name, node.parameters, node.type,
+                        //         ts.visitNode(node.body, deepInspectVisitor)
+                        //     );
+                        // } else if (ts.isFunctionExpression(node)) {
+                        //     result = f.updateFunctionExpression(node,
+                        //         node.modifiers, node.asteriskToken, node.name, node.typeParameters, node.parameters, node.type,
+                        //         ts.visitNode(node.body, deepInspectVisitor),
+                        //     );
+                        // } else if (ts.isArrowFunction(node)) {
+                        //     result = f.updateArrowFunction(node,
+                        //         node.modifiers, node.typeParameters, node.parameters, node.type, node.equalsGreaterThanToken,
+                        //         ts.visitNode(node.body, deepInspectVisitor),
+                        //     );
+                        // } else if (ts.isToken(node) || ts.isLiteralExpression(node)) {
+                        //     result = node;
+                    }
+                    else if (ts.isParenthesizedExpression(node)) {
+                        result = f.updateParenthesizedExpression(node, ts.visitNode(node.expression, deepInspectVisitor(node)));
+                    }
+                    else if (stack.length > 0 && ts.isToken(node) && !ts.isIdentifier(node)) {
                         result = node;
                     }
-                    else if (ts.isExpression(node) && (node.parent == undefined || ts.isExpression(node.parent) || stack.length == 0)) {
+                    else if (ts.isExpression(node)
+                        && !( /*  Identifiers appear in non-expression contexts. */ts.isIdentifier(node) && (ts.isVariableDeclaration(parent) // const IDENT = 123;
+                            || ts.isBindingElement(parent) // const [IDENT] = [123];
+                            || ts.isPropertyAccessExpression(parent) // something.IDENT;
+                            || ts.isFunctionLike(parent) // function IDENT() {}; ({ IDENT() {}, get IDENT() {} });
+                            || ts.isParameter(parent) // function(IDENT) {};
+                            || ts.isObjectLiteralElementLike(parent) // ({ IDENT: 123 });
+                            || ts.isClassElement(parent) // class { IDENT = 123; };
+                            || ts.isClassLike(parent) // class IDENT {};
+                        ) && parent.name == node)
+                        && !( /* Preserve the left-hand side of assignment operators */ts.isBinaryExpression(parent)
+                            && parent.operatorToken.kind >= typescript_1.SyntaxKind.FirstAssignment
+                            && parent.operatorToken.kind <= typescript_1.SyntaxKind.LastAssignment
+                            && parent.left == node)) {
+                        // let original = ts.getOriginalNode(node);
                         const pretty = printer.printNode(ts.EmitHint.Expression, node, sourceFile);
                         const ident = createTempVar(`_${pretty.replace(/\W/g, '_')}`);
                         varDecs.push(f.createVariableDeclaration(ident, undefined, undefined, unevaluatedShorthand));
-                        const part = { pretty, ident, children: [] };
+                        const part = { node, result: undefined, pretty, ident, children: [] };
                         if (stack.length == 0) {
                             if (rootPart != undefined)
                                 throw new Error('wtf');
@@ -215,32 +292,51 @@ const makeTransformerFactory = (program, optsIn) => (ctx) => (sourceFile) => {
                         }
                         stack.push(part);
                         if (ts.isCallExpression(node)) {
-                            result = f.updateCallExpression(node, node.expression, node.typeArguments, ts.visitNodes(node.arguments, deepInspectVisitor));
-                        }
-                        else if (ts.isPropertyAccessExpression(node)) {
-                            result = f.updatePropertyAccessExpression(node, ts.visitEachChild(node.expression, deepInspectVisitor, ctx), node.name);
+                            if (checkFunctionDeclarationJSDocTagsFromCallExpression(node, tag => inlineTagSet.has(tag.tagName.text)) != null) {
+                                // Don't recurse into other @inline calls! It leads to bugs, explosive expansion, and madness!
+                                result = node;
+                            }
+                            else {
+                                let funcExpr = node.expression;
+                                if (ts.isPropertyAccessExpression(funcExpr)) {
+                                    funcExpr = f.updatePropertyAccessExpression(funcExpr, ts.visitNode(funcExpr.expression, deepInspectVisitor(node)), funcExpr.name);
+                                }
+                                else if (ts.isIdentifier(funcExpr)) {
+                                    // required for nested @inline calls
+                                }
+                                else {
+                                    funcExpr = ts.visitNode(funcExpr, deepInspectVisitor(node)); //preserve 'this'
+                                }
+                                result = f.updateCallExpression(node, setOriginalNode(funcExpr, node.expression), node.typeArguments, ts.visitNodes(node.arguments, deepInspectVisitor(node)));
+                            }
+                            // } else if (ts.isPropertyAccessExpression(node)) {
+                            //     result = f.updatePropertyAccessExpression(node,
+                            //         ts.visitNode(node.expression, deepInspectVisitor(node)),
+                            //         node.name
+                            //     );
                         }
                         else if (ts.isMetaProperty(node)) {
                             result = node;
                         }
                         else if ((ts.isPostfixUnaryExpression(node) || ts.isPrefixUnaryExpression(node)) && (node.operator == typescript_1.SyntaxKind.PlusPlusToken || node.operator == typescript_1.SyntaxKind.MinusMinusToken)) {
-                            result = node;
+                            result = node; // preserve ++ and --
                         }
                         else {
-                            result = ts.visitEachChild(node, deepInspectVisitor, ctx);
+                            result = ts.visitEachChild(node, deepInspectVisitor(node), ctx);
                         }
-                        result = f.createAssignment(ident, result);
+                        result = f.createParenthesizedExpression(f.createAssignment(ident, result));
                         stack.pop();
+                        part.result = result;
                     }
                     else {
-                        result = ts.visitEachChild(node, deepInspectVisitor, ctx);
+                        result = ts.visitEachChild(node, deepInspectVisitor(node), ctx);
                     }
-                    return result;
+                    return result != node ? setOriginalNode(result, node) : result;
                 };
-                const ffs = ts.visitNode(callValue, deepInspectVisitor);
+                const ffs = ts.visitNode(callValue, deepInspectVisitor(callNode));
                 if (rootPart == undefined) {
                     debugger;
-                    let ffffssss = ts.visitNode(callValue, deepInspectVisitor);
+                    let ffffssss = ts.visitNode(callValue, deepInspectVisitor(callNode));
                     throw new Error('wtf' + ffffssss);
                 }
                 callValue = ffs;
@@ -279,14 +375,15 @@ const makeTransformerFactory = (program, optsIn) => (ctx) => (sourceFile) => {
                             ]))))
                         ]));
                     }
-                    return f.createPropertyAccessExpression(callNode.expression, `upvalue_${node.text}`);
+                    return setOriginalNode(f.createPropertyAccessExpression(callNode.expression, `upvalue_${node.text}`), node);
                 }
                 if (declInfo.parameterInfosByIdentifier.has(node)) {
                     const paramInfo = declInfo.parameterInfosByIdentifier.get(node);
+                    // return setOriginalNode(recreateNodes(paramAccessReplacements.get(paramInfo)!, ctx), node);
                     return paramAccessReplacements.get(paramInfo);
                 }
             }
-            return ts.visitEachChild(node, bodyVisitor, ctx);
+            return setOriginalNode(ts.visitEachChild(node, bodyVisitor, ctx), node);
         };
         const body = recreateNodes(f.createBlock([
             ...(varDecs.length > 0 ? [f.createVariableStatement([], f.createVariableDeclarationList(varDecs, ts.NodeFlags.Let))] : []),
@@ -333,6 +430,16 @@ const recreateNodes = (root, ctx) => {
     // // const dedup = new Map<ts.Node, ts.Node>();
     const out = ts_clone_node_1.cloneNode(root, {
         preserveSymbols: true,
+        setOriginalNodes: true,
+        setParents: true,
+        factory: Object.assign(Object.assign({}, ctx.factory), { createTemplateTail: (text, rawText, templateFlags) => {
+                if (text == '\b' && rawText == '\\b') {
+                    // !!!?!???!!?!!?!!?!?!!?!?!?!?!?!?!?!?!?!?!?!?!??!!!?!?!!!????!?!?!??!?!???????????!!!?!?!???!?!
+                    text = '';
+                    rawText = '';
+                }
+                return ctx.factory.createTemplateTail(text, rawText, templateFlags);
+            } }),
         finalize: (clonedNode, oldNode) => {
             // if (dedup.has(oldNode))
             //     return dedup.get(oldNode) as any;

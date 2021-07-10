@@ -8,6 +8,7 @@ interface TransformerConfig {
         inlineAsBlock: string;
         inlineAsImmediatelyInvokedArrowFunction: string;
         lazy: string;
+        inspectable: string;
         specialGetCallSiteDetails: string;
     };
 }

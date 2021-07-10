@@ -1,11 +1,37 @@
 import * as ts from 'typescript';
-import {SyntaxKind} from 'typescript';
+import {SyntaxKind, TokenFlags} from 'typescript';
 import {cloneNode} from "ts-clone-node";
+
+ts.SyntaxKind.NoSubstitutionTemplateLiteral;
 
 declare module 'typescript' {
     /* @internal */
     function isExpression(node: ts.Node): node is ts.Expression;
 }
+
+function setOriginalNode<T extends ts.Node>(node: T, original: ts.Node | undefined): T {
+    if (node == original)
+        return node;
+    return ts.setOriginalNode(node, original);
+}
+
+function setImmediateParent<T extends ts.Node | ts.Node[]>(nodes: T, parent: ts.Node): T {
+    for (const node of 'length' in nodes ? nodes as ts.Node[] : [nodes as ts.Node]) {
+        (node as any).parent = parent;
+    }
+    return nodes;
+}
+
+// function fixParentsRecursively<T extends ts.Node | ts.Node[]>(nodes: T, ctx: ts.TransformationContext): T {
+//     const visitor = (parent: ts.Node) => (node: ts.Node) => {
+//         (node as any).parent = parent;
+//         ts.visitEachChild(node, visitor(node), ctx)
+//         return undefined;
+//     }
+//     for (const node of 'length' in nodes ? nodes as ts.Node[] : [nodes as ts.Node]) {
+//         ts.visitEachChild(node, visitor(node), ctx)
+//     }
+// }
 
 interface TransformerConfig {
     jsDocTagNames: {
@@ -13,6 +39,7 @@ interface TransformerConfig {
         inlineAsBlock: string;
         inlineAsImmediatelyInvokedArrowFunction: string;
         lazy: string;
+        inspectable: string;
         specialGetCallSiteDetails: string;
     }
 }
@@ -23,6 +50,7 @@ const defaultOpts = {
         inlineAsBlock: 'inline-as-block',
         inlineAsImmediatelyInvokedArrowFunction: 'inline-as-func',
         lazy: 'lazy',
+        inspectable: 'inspectable',
         specialGetCallSiteDetails: 'inline-special-getCallSiteDetails',
     }
 };
@@ -37,6 +65,7 @@ const makeTransformerFactory = (program: ts.Program, optsIn?: TransformerConfig)
         sym: ts.Symbol;
         decl: ts.ParameterDeclaration;
         isLazy: boolean;
+        isInspectable: boolean;
     }
 
     class InlineableFunctionInfo {
@@ -63,10 +92,11 @@ const makeTransformerFactory = (program: ts.Program, optsIn?: TransformerConfig)
                 if (!sym)
                     throw new Error('wtf');
 
-                const lazyTags = ts.getJSDocTags(paramDecl).filter(tag => tag.tagName.text == opts.jsDocTagNames.lazy);
-                const isLazy = lazyTags.length > 0;
+                const tags = ts.getJSDocTags(paramDecl);
+                const isLazy = tags.some(tag => tag.tagName.text == opts.jsDocTagNames.lazy);
+                const isInspectable = tags.some(tag => tag.tagName.text == opts.jsDocTagNames.inspectable);
 
-                const info = {sym, decl: paramDecl, isLazy};
+                const info = {sym, decl: paramDecl, isLazy, isInspectable};
                 parameterInfosBySymbol.set(sym, info);
                 return info;
             });
@@ -79,7 +109,7 @@ const makeTransformerFactory = (program: ts.Program, optsIn?: TransformerConfig)
                     return;
 
                 const symbol = checker.getSymbolAtLocation(node);
-                if (!symbol || (symbol.getFlags() & ts.SymbolFlags.Type))
+                if (!symbol || !(symbol.getFlags() & ts.SymbolFlags.Value))
                     return;
 
                 let hasDeclarationsWithout = false;
@@ -176,22 +206,8 @@ const makeTransformerFactory = (program: ts.Program, optsIn?: TransformerConfig)
         ];
     };
 
-    const maybeInlineCallExpression = (visitNode: ts.Node): ts.Node | null => {
-        let callNode: ts.CallExpression, containingNode;
-        let areWeVisitingParent;
-        if (ts.isCallExpression(visitNode)) {
-            areWeVisitingParent = false;
-            callNode = visitNode;
-            containingNode = visitNode.parent;
-        } else if (ts.isExpressionStatement(visitNode) && ts.isCallExpression(visitNode.expression)) {
-            areWeVisitingParent = true;
-            callNode = visitNode.expression;
-            containingNode = visitNode;
-        } else {
-            return null;
-        }
-
-        const signature = checker.getResolvedSignature(callNode);
+    const checkFunctionDeclarationJSDocTagsFromCallExpression = (callExpr: ts.CallExpression, check: (tag: ts.JSDocTag) => boolean) => {
+        const signature = checker.getResolvedSignature(callExpr);
         if (signature === undefined)
             return null;
 
@@ -199,7 +215,7 @@ const makeTransformerFactory = (program: ts.Program, optsIn?: TransformerConfig)
         if (decl === undefined)
             return null;
 
-        const inlineTags = ts.getJSDocTags(decl).filter(tag => inlineTagSet.has(tag.tagName.text));
+        const inlineTags = ts.getJSDocTags(decl).filter(check);
         if (inlineTags.length == 0)
             return null;
 
@@ -218,6 +234,28 @@ const makeTransformerFactory = (program: ts.Program, optsIn?: TransformerConfig)
                 throw new Error(`ts-inline: Cannot yet handle inlining of functions defined using a ts.SyntaxKind.${ts.SyntaxKind[decl.kind]} visitNode`);
         }
 
+        return {inlineTags, decl};
+    };
+
+    const maybeInlineCallExpression = (visitNode: ts.Node): ts.Node | null => {
+        let callNode: ts.CallExpression, containingNode;
+        let areWeVisitingParent;
+        if (ts.isCallExpression(visitNode)) {
+            areWeVisitingParent = false;
+            callNode = visitNode;
+            containingNode = visitNode.parent;
+        } else if (ts.isExpressionStatement(visitNode) && ts.isCallExpression(visitNode.expression)) {
+            areWeVisitingParent = true;
+            callNode = visitNode.expression;
+            containingNode = visitNode;
+        } else {
+            return null;
+        }
+
+        const check = checkFunctionDeclarationJSDocTagsFromCallExpression(callNode, tag => inlineTagSet.has(tag.tagName.text));
+        if (check == null) return null;
+        const {inlineTags, decl} = check;
+
         let declInfo = getOrPut(inlineableFunctionInfos, decl, () => new InlineableFunctionInfo(decl));
 
         const mustBeBlock = inlineTags.some(tag => tag.tagName.text == opts.jsDocTagNames.inlineAsBlock);
@@ -230,6 +268,8 @@ const makeTransformerFactory = (program: ts.Program, optsIn?: TransformerConfig)
         const paramAccessReplacements = new Map<InlineableFunctionParamInfo, ts.Expression>();
 
         interface ParamPart {
+            node: ts.Node;
+            result: ts.Node;
             pretty: string;
             ident: ts.Identifier;
             children: ParamPart[];
@@ -265,26 +305,92 @@ const makeTransformerFactory = (program: ts.Program, optsIn?: TransformerConfig)
             if (callValue === undefined)
                 callValue = f.createVoidZero();
 
-            if (needsCallSiteDetails) {
+            if (needsCallSiteDetails && paramInfo.isInspectable) {
                 let rootPart: ParamPart | undefined = undefined;
                 const stack: ParamPart[] = [];
-                const deepInspectVisitor: ts.Visitor = node => {
+                const deepInspectVisitor: (parent: ts.Node) => ts.Visitor = parent => node => {
                     let result;
                     // if (ts.isFunctionExpression(node) || ts.isArrowFunction(node)) {
                     //     result = node;
-                    // } else if (ts.isToken(node) || ts.isLiteralExpression(node)) {
-                    //     result = node;
-                    // } else if (ts.isParenthesizedExpression(node)) {
-                    //     result = node;
-                    // } else
-                    if (stack.length > 0 && ts.isToken(node) && !ts.isIdentifier(node)) {
+                    if (
+                        node.kind >= ts.SyntaxKind.FirstTypeNode && node.kind <= ts.SyntaxKind.LastTypeNode
+                        || ts.isParameter(node)
+                        || ts.isClassExpression(node)
+                    ) {
                         result = node;
-                    } else if (ts.isExpression(node) && (node.parent == undefined || ts.isExpression(node.parent) || stack.length == 0)) {
+                        // } else if (ts.isPropertyAssignment(node)) {
+                        //     // Property name is an identifier but we can't treat it like an expression
+                        //     result = f.updatePropertyAssignment(node,
+                        //         node.name, ts.visitNode(node.initializer, deepInspectVisitor)
+                        //     );
+                    } else if (ts.isShorthandPropertyAssignment(node)) {
+                        // Convert shorthand ( {x} ) to regular ( {x: x} ) so we can inspect the value
+                        result = f.createPropertyAssignment(
+                            node.name, ts.visitNode(node.name, deepInspectVisitor(node))
+                        );
+                        // } else if (ts.isMethodDeclaration(node)) {
+                        //     // Method name is an identifier but we can't treat it like an expression
+                        //     result = f.updateMethodDeclaration(node,
+                        //         node.decorators, node.modifiers, node.asteriskToken, node.name, node.questionToken, node.typeParameters, node.parameters, node.type,
+                        //         ts.visitNode(node.body, deepInspectVisitor)
+                        //     );
+                        // } else if (ts.isSetAccessorDeclaration(node)) {
+                        //     // Accessor property name is an identifier but we can't treat it like an expression
+                        //     result = f.updateSetAccessorDeclaration(node,
+                        //         node.decorators, node.modifiers, node.name, node.parameters,
+                        //         ts.visitNode(node.body, deepInspectVisitor)
+                        //     );
+                        // } else if (ts.isGetAccessorDeclaration(node)) {
+                        //     // Accessor property name is an identifier but we can't treat it like an expression
+                        //     result = f.updateGetAccessorDeclaration(node,
+                        //         node.decorators, node.modifiers, node.name, node.parameters, node.type,
+                        //         ts.visitNode(node.body, deepInspectVisitor)
+                        //     );
+                        // } else if (ts.isFunctionExpression(node)) {
+                        //     result = f.updateFunctionExpression(node,
+                        //         node.modifiers, node.asteriskToken, node.name, node.typeParameters, node.parameters, node.type,
+                        //         ts.visitNode(node.body, deepInspectVisitor),
+                        //     );
+                        // } else if (ts.isArrowFunction(node)) {
+                        //     result = f.updateArrowFunction(node,
+                        //         node.modifiers, node.typeParameters, node.parameters, node.type, node.equalsGreaterThanToken,
+                        //         ts.visitNode(node.body, deepInspectVisitor),
+                        //     );
+                        // } else if (ts.isToken(node) || ts.isLiteralExpression(node)) {
+                        //     result = node;
+                    } else if (ts.isParenthesizedExpression(node)) {
+                        result = f.updateParenthesizedExpression(node,
+                            ts.visitNode(node.expression, deepInspectVisitor(node))
+                        );
+                    } else if (stack.length > 0 && ts.isToken(node) && !ts.isIdentifier(node)) {
+                        result = node;
+                    } else if (
+                        ts.isExpression(node)
+                        && !( /*  Identifiers appear in non-expression contexts. */
+                            ts.isIdentifier(node) && (
+                                ts.isVariableDeclaration(parent) // const IDENT = 123;
+                                || ts.isBindingElement(parent) // const [IDENT] = [123];
+                                || ts.isPropertyAccessExpression(parent) // something.IDENT;
+                                || ts.isFunctionLike(parent) // function IDENT() {}; ({ IDENT() {}, get IDENT() {} });
+                                || ts.isParameter(parent) // function(IDENT) {};
+                                || ts.isObjectLiteralElementLike(parent) // ({ IDENT: 123 });
+                                || ts.isClassElement(parent) // class { IDENT = 123; };
+                                || ts.isClassLike(parent) // class IDENT {};
+                            ) && parent.name == node
+                        )
+                        && !( /* Preserve the left-hand side of assignment operators */
+                            ts.isBinaryExpression(parent)
+                            && parent.operatorToken.kind >= SyntaxKind.FirstAssignment
+                            && parent.operatorToken.kind <= SyntaxKind.LastAssignment
+                            && parent.left == node
+                        )
+                    ) {
+                        // let original = ts.getOriginalNode(node);
                         const pretty = printer.printNode(ts.EmitHint.Expression, node, sourceFile);
                         const ident = createTempVar(`_${pretty.replace(/\W/g, '_')}`);
                         varDecs.push(f.createVariableDeclaration(ident, undefined, undefined, unevaluatedShorthand));
 
-                        const part = {pretty, ident, children: []};
+                        const part = {node, result: undefined! as ts.Node, pretty, ident, children: []};
                         if (stack.length == 0) {
                             if (rootPart != undefined) throw new Error('wtf');
                             rootPart = part;
@@ -294,34 +400,51 @@ const makeTransformerFactory = (program: ts.Program, optsIn?: TransformerConfig)
 
                         stack.push(part);
                         if (ts.isCallExpression(node)) {
-                            result = f.updateCallExpression(node,
-                                node.expression,
-                                node.typeArguments,
-                                ts.visitNodes(node.arguments, deepInspectVisitor)
-                            );
-                        } else if (ts.isPropertyAccessExpression(node)) {
-                            result = f.updatePropertyAccessExpression(node,
-                                ts.visitEachChild(node.expression, deepInspectVisitor, ctx),
-                                node.name
-                            );
+                            if (checkFunctionDeclarationJSDocTagsFromCallExpression(node, tag => inlineTagSet.has(tag.tagName.text)) != null) {
+                                // Don't recurse into other @inline calls! It leads to bugs, explosive expansion, and madness!
+                                result = node;
+                            } else {
+                                let funcExpr = node.expression;
+                                if (ts.isPropertyAccessExpression(funcExpr)) {
+                                    funcExpr = f.updatePropertyAccessExpression(funcExpr,
+                                        ts.visitNode(funcExpr.expression, deepInspectVisitor(node)),
+                                        funcExpr.name
+                                    );
+                                } else if (ts.isIdentifier(funcExpr)) {
+                                    // required for nested @inline calls
+                                } else {
+                                    funcExpr = ts.visitNode(funcExpr, deepInspectVisitor(node)); //preserve 'this'
+                                }
+                                result = f.updateCallExpression(node,
+                                    setOriginalNode(funcExpr, node.expression),
+                                    node.typeArguments,
+                                    ts.visitNodes(node.arguments, deepInspectVisitor(node))
+                                );
+                            }
+                            // } else if (ts.isPropertyAccessExpression(node)) {
+                            //     result = f.updatePropertyAccessExpression(node,
+                            //         ts.visitNode(node.expression, deepInspectVisitor(node)),
+                            //         node.name
+                            //     );
                         } else if (ts.isMetaProperty(node)) {
                             result = node;
                         } else if ((ts.isPostfixUnaryExpression(node) || ts.isPrefixUnaryExpression(node)) && (node.operator == SyntaxKind.PlusPlusToken || node.operator == SyntaxKind.MinusMinusToken)) {
-                            result = node;
+                            result = node; // preserve ++ and --
                         } else {
-                            result = ts.visitEachChild(node, deepInspectVisitor, ctx);
+                            result = ts.visitEachChild(node, deepInspectVisitor(node), ctx);
                         }
-                        result = f.createAssignment(ident, result);
+                        result = f.createParenthesizedExpression(f.createAssignment(ident, result));
                         stack.pop();
+                        part.result = result;
                     } else {
-                        result = ts.visitEachChild(node, deepInspectVisitor, ctx);
+                        result = ts.visitEachChild(node, deepInspectVisitor(node), ctx);
                     }
-                    return result;
+                    return result != node ? setOriginalNode(result, node) : result;
                 };
-                const ffs = ts.visitNode(callValue, deepInspectVisitor);
+                const ffs = ts.visitNode(callValue, deepInspectVisitor(callNode));
                 if (rootPart == undefined) {
                     debugger;
-                    let ffffssss = ts.visitNode(callValue, deepInspectVisitor);
+                    let ffffssss = ts.visitNode(callValue, deepInspectVisitor(callNode));
                     throw new Error('wtf' + ffffssss);
                 }
                 callValue = ffs;
@@ -389,15 +512,16 @@ const makeTransformerFactory = (program: ts.Program, optsIn?: TransformerConfig)
                         );
                     }
 
-                    return f.createPropertyAccessExpression(callNode.expression, `upvalue_${node.text}`);
+                    return setOriginalNode(f.createPropertyAccessExpression(callNode.expression, `upvalue_${node.text}`), node);
                 }
 
                 if (declInfo.parameterInfosByIdentifier.has(node)) {
                     const paramInfo = declInfo.parameterInfosByIdentifier.get(node)!;
+                    // return setOriginalNode(recreateNodes(paramAccessReplacements.get(paramInfo)!, ctx), node);
                     return paramAccessReplacements.get(paramInfo)!;
                 }
             }
-            return ts.visitEachChild(node, bodyVisitor, ctx);
+            return setOriginalNode(ts.visitEachChild(node, bodyVisitor, ctx), node);
         };
 
         const body = recreateNodes(f.createBlock([
@@ -466,24 +590,37 @@ const makeTransformerFactory = (program: ts.Program, optsIn?: TransformerConfig)
 
 const recreateNodes = <T extends ts.Node>(root: T, ctx: ts.TransformationContext): T => {
     // // const dedup = new Map<ts.Node, ts.Node>();
-    // const out = cloneNode(root, {
-    //     preserveSymbols: true,
-    //     finalize: (clonedNode, oldNode) => {
-    //         // if (dedup.has(oldNode))
-    //         //     return dedup.get(oldNode) as any;
-    //
-    //         ts.setTextRange(clonedNode, undefined);
-    //         // dedup.set(oldNode, clonedNode);
-    //         // return clonedNode as any;
-    //
-    //         if (ts.isIdentifier(oldNode)) {
-    //             (clonedNode as any).autoGenerateFlags = (oldNode as any).autoGenerateFlags;
-    //             (clonedNode as any).autoGenerateId = -1 * (oldNode as any).autoGenerateId;
-    //         }
-    //     }
-    // });
-    // return out;
-    return root;
+    const out = cloneNode(root, {
+        preserveSymbols: true,
+        setOriginalNodes: true,
+        setParents: true,
+        factory: {
+            ...ctx.factory,
+            createTemplateTail: (text: string, rawText?: string, templateFlags?: TokenFlags) => {
+                if (text == '\b' && rawText == '\\b') {
+                    // !!!?!???!!?!!?!!?!?!!?!?!?!?!?!?!?!?!?!?!?!?!??!!!?!?!!!????!?!?!??!?!???????????!!!?!?!???!?!
+                    text = '';
+                    rawText = '';
+                }
+                return ctx.factory.createTemplateTail(text, rawText, templateFlags);
+            }
+        },
+        finalize: (clonedNode, oldNode) => {
+            // if (dedup.has(oldNode))
+            //     return dedup.get(oldNode) as any;
+
+            ts.setTextRange(clonedNode, undefined);
+            // dedup.set(oldNode, clonedNode);
+            // return clonedNode as any;
+
+            if (ts.isIdentifier(oldNode)) {
+                (clonedNode as any).autoGenerateFlags = (oldNode as any).autoGenerateFlags;
+                (clonedNode as any).autoGenerateId = -1 * (oldNode as any).autoGenerateId;
+            }
+        }
+    });
+    return out;
+    // return root;
 };
 
 const forEachChildRecursive = <T>(root: ts.Node, cb: (node: ts.Node) => T | undefined): T | undefined => {

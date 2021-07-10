@@ -94,13 +94,13 @@ it("should transform normal assert call into inspecto patronum assert call", () 
         }
         
         /** @inline */
-        function assert(v: unknown, /** @lazy */ msg?: string): asserts v {
+        function assert( /** @inspectable */ v: unknown, /** @lazy */ msg?: string): asserts v {
             testUpvalue++;
             if(!v) throw new AssertionFailedError(v, msg, getCallSiteDetails()?.params[0]);
         }
         
         /** @inline */
-        function onlyDefined<T>(v: T, /** @lazy */ msg?: string): NonNullable<T> {
+        function onlyDefined<T>( /** @inspectable */ v: T, /** @lazy */ msg?: string): NonNullable<T> {
             testUpvalue++;
             if(v === undefined || v === null)
                 throw new AssertionFailedError(v, msg, getCallSiteDetails()?.params[0]);
@@ -109,34 +109,50 @@ it("should transform normal assert call into inspecto patronum assert call", () 
         
         /*********************/
         /*********************/
-        
+
         {
             let testUpvalue = 0;
             assert(true, shouldNotBeCalled());
             onlyDefined(false);
             assert(testUpvalue == 0);
-            
+
             let x = 0;
             assert(true, String(x++));
             assert(x == 0);
         }
         assert(testUpvalue == 5);
-        
+
         /*********************/
         /*********************/
-        
+
         try {
             const two = 2;
             const three = 3;
             let fourFiveSix = 4;
-            assert(two + 1 + fourFiveSix++ == fourFiveSix + 2 * three - parseFloat('1.5' + 'e2') + ++fourFiveSix, \`oh \${'no'}!\`);
+            let accessedFromFunction = 9;
+            const callThrice = (f: () => number) => { f(); f(); return f(); }
+            assert(two + 1 + fourFiveSix++ + callThrice(() => ++accessedFromFunction) == fourFiveSix + 2 * three - parseFloat('1.5' + 'e2') + ++fourFiveSix && fourFiveSix + 1 == 999, \`oh \${'no'}!\`);
         } catch(e) {
             console.log(e);
         }
-        
+
         /*********************/
         /*********************/
-        
+
+        const o = { files: [ "blah" ] };
+        assert(o.files.length == 1);
+
+        const input = {
+            process: {
+                fileName: "hmm",
+            },
+        };
+
+        assert(true, \`Could not parse file name: \${input.process.fileName}\`);
+
+        /*********************/
+        /*********************/
+
         const x = 2, y = 2, z = 3;
         const tests = [
             function ConditionalExpression() { assert(x ? y : z); },
@@ -170,8 +186,8 @@ it("should transform normal assert call into inspecto patronum assert call", () 
             // },
             function ArrayLiteralExpression() { assert([x,y,z][x] == z); },
             function ParenthesizedExpression() { assert(((((((x)))))) + 2 == (y+((2)))); },
-            function ObjectLiteralExpression() { assert(({x:x,y,['z']: z,get a() { return x; }}).a == x); },
-            function ClassExpression() { assert((new class { constructor(public a = x){}}).a == x); },
+            function ObjectLiteralExpression() { assert(({x:x,y,['z']: z,b() { return x},get a() { return x; }}).a == x); },
+            function ClassExpression() { assert((new class { q = 5; constructor(public a = x){}}).a == x); },
             function FunctionExpression() { assert((function (q: number) { return x+q; })(2) == x+2); },
             function Identifier() { assert(x); },
             function RegularExpressionLiteral() { assert(x.toString().match(/^2$/)); },
@@ -185,8 +201,12 @@ it("should transform normal assert call into inspecto patronum assert call", () 
             function ThisKeyword(this: any) { assert(this === this); },
             function SuperKeyword() { new class extends Error { constructor() { super('test'); assert(super.message == super.message); } } },
             // function NonNullExpression() {},
-            function MetaProperty() { function metaProperty() { assert(new.target); } }
+            function MetaProperty() { function metaProperty() { assert(new.target); } },
             // function ImportKeyword() { try{ assert(import('fail')) } catch(e) {}; }
+           
+            // special
+            function AssignmentOperator() { let a, b, c, o = {d:0}; assert(a = b = c = o.d = 4); },
+            function Nested() { assert(onlyDefined(onlyDefined(onlyDefined(onlyDefined(x == y))))); }
         ]
         for (const test of tests) {
             test();
