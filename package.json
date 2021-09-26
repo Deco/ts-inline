@@ -1,6 +1,6 @@
 {
   "name": "ts-inline",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "TypeScript compiler extension for inlining methods",
   "author": {
     "name": "Declan White",
